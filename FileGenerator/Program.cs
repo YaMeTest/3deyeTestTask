@@ -1,6 +1,6 @@
 ﻿using FileGenerator;
 
-long sizeBytes = 100 * 1024 * 1024;
+long sizeBytes = 1000 * 1024 * 1024;
 
 TextFileGenerator.GenerateFile(
     outputPath: "test.txt",

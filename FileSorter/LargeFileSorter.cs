@@ -16,10 +16,8 @@ public sealed class LargeFileSorter : IDisposable
     private readonly string _workingDirectory;
 
     private readonly string _statePath;
-    private readonly string _tmpPath;
 
     private const string StateFileName = "sort-state.json";
-    private const string FinalMergedFileName = "final.sorted";
 
 
     private static readonly JsonSerializerOptions JsonOptions = new()
@@ -32,7 +30,7 @@ public sealed class LargeFileSorter : IDisposable
         Access = FileAccess.Read,
         Mode = FileMode.Open,
         Share = FileShare.Read,
-        BufferSize = 1024 * 1024,
+        BufferSize = 256 * 1024 * 1024,
         Options = FileOptions.SequentialScan | FileOptions.Asynchronous
     };
 
@@ -41,7 +39,7 @@ public sealed class LargeFileSorter : IDisposable
         Access = FileAccess.Write,
         Mode = FileMode.Create,
         Share = FileShare.None,
-        BufferSize = 1024 * 1024,
+        BufferSize = 256 * 1024 * 1024,
         Options = FileOptions.Asynchronous
     };
 
@@ -49,9 +47,9 @@ public sealed class LargeFileSorter : IDisposable
         string inputPath,
         string outputPath,
         string tempDirectory,
-        long maxChunkBytes = 256 * 1024 * 1024,
+        long maxChunkBytes = 1024 * 1024 * 1024,
         int mergeFileCount = 32,
-        int maxConcurrentChunkJobs = 4)
+        int maxConcurrentChunkJobs = 6)
     {
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxChunkBytes);
         ArgumentOutOfRangeException.ThrowIfLessThan(mergeFileCount, 2);
@@ -72,9 +70,9 @@ public sealed class LargeFileSorter : IDisposable
 
         Directory.CreateDirectory(_tempDirectory);
         _workingDirectory = Path.Combine(_tempDirectory, $"sort-{_jobId}");
+        Directory.CreateDirectory(_workingDirectory);
 
         _statePath = Path.Combine(_workingDirectory, StateFileName);
-        _tmpPath = _statePath + ".tmp";
     }
 
     public async Task SortFileAsync(CancellationToken cancellationToken = default)
@@ -87,15 +85,7 @@ public sealed class LargeFileSorter : IDisposable
         ValidateStateAgainstRequest(state);
 
         await CreateSortedChunksAsync(state, cancellationToken).ConfigureAwait(false);
-
-        string finalFile = await MergeSortedChunksMultiPassAsync(
-            _workingDirectory,
-            state,
-            cancellationToken).ConfigureAwait(false);
-
-        string outputTemp = _outputPath + ".tmp";
-        File.Copy(finalFile, outputTemp, overwrite: true);
-        File.Move(outputTemp, _outputPath, overwrite: true);
+        await MergeSortedChunksMultiPassAsync(state, cancellationToken).ConfigureAwait(false);
 
         state.Status = SortJobStatus.Completed;
         state.CompletedAtUtc = DateTimeOffset.UtcNow;
@@ -115,7 +105,7 @@ public sealed class LargeFileSorter : IDisposable
 
         var semaphore = new SemaphoreSlim(_maxConcurrentChunkJobs);
         var pending = new List<Task<ChunkWriteResult>>();
-        var chunk = new List<LineRecord>(250_000);
+        var chunk = new List<LineRecord>(2048);
         long estimatedBytes = 0;
         long lineNumber = 0;
         int nextChunkIndex = state.CompletedChunks.Count;
@@ -140,7 +130,7 @@ public sealed class LargeFileSorter : IDisposable
                 int chunkIndex = nextChunkIndex++;
                 pending.Add(ScheduleChunkWriteAsync(chunk, semaphore, chunkIndex, lineNumber, cancellationToken));
 
-                chunk = new List<LineRecord>(250_000);
+                chunk = new List<LineRecord>(2048);
                 estimatedBytes = 0;
             }
         }
@@ -228,11 +218,8 @@ public sealed class LargeFileSorter : IDisposable
         return tempFile;
     }
 
-    private async Task<string> MergeSortedChunksMultiPassAsync(string workingDir, SortJobState state, CancellationToken cancellationToken)
+    private async Task MergeSortedChunksMultiPassAsync(SortJobState state, CancellationToken cancellationToken)
     {
-        if (state.MergeCompleted && !string.IsNullOrWhiteSpace(state.FinalFilePath) && File.Exists(state.FinalFilePath))
-            return state.FinalFilePath;
-
         var current = state.CompletedChunks
             .OrderBy(x => x.ChunkIndex)
             .Select(x => x.Path)
@@ -240,14 +227,13 @@ public sealed class LargeFileSorter : IDisposable
 
         if (current.Length == 0)
         {
-            string empty = Path.Combine(workingDir, "empty.out");
+            string empty = Path.Combine(_workingDirectory, "empty.out");
             if (!File.Exists(empty))
                 File.Create(empty).Dispose();
 
             state.MergeCompleted = true;
             state.FinalFilePath = empty;
             await SaveStateAsync(state, cancellationToken).ConfigureAwait(false);
-            return empty;
         }
 
         if (current.Length == 1)
@@ -255,7 +241,6 @@ public sealed class LargeFileSorter : IDisposable
             state.MergeCompleted = true;
             state.FinalFilePath = current[0];
             await SaveStateAsync(state, cancellationToken).ConfigureAwait(false);
-            return current[0];
         }
 
         int passNumber = 0;
@@ -270,7 +255,7 @@ public sealed class LargeFileSorter : IDisposable
             {
                 var batch = current.Skip(i).Take(_mergeFileCount).ToArray();
                 int batchNumber = i / _mergeFileCount;
-                string merged = Path.Combine(workingDir, $"merge-p{passNumber:D4}-b{batchNumber:D8}.merge");
+                string merged = Path.Combine(_workingDirectory, $"merge-p{passNumber:D4}-b{batchNumber:D8}.merge");
 
                 if (!File.Exists(merged))
                 {
@@ -302,17 +287,11 @@ public sealed class LargeFileSorter : IDisposable
             passNumber++;
         }
 
-        string finalFile = Path.Combine(workingDir, FinalMergedFileName);
-        if (!string.Equals(current[0], finalFile, StringComparison.OrdinalIgnoreCase))
-        {
-            File.Copy(current[0], finalFile, overwrite: true);
-        }
+        File.Copy(current[0], _outputPath, overwrite: true);
 
         state.MergeCompleted = true;
-        state.FinalFilePath = finalFile;
+        state.FinalFilePath = _outputPath;
         await SaveStateAsync(state, cancellationToken).ConfigureAwait(false);
-
-        return finalFile;
     }
 
     private static async Task MergeBatchAsync(
@@ -406,19 +385,17 @@ public sealed class LargeFileSorter : IDisposable
             Status = SortJobStatus.Created
         };
 
+        File.Create(_statePath).Close();
+
         await SaveStateAsync(created, cancellationToken).ConfigureAwait(false);
         return created;
     }
 
     private async Task SaveStateAsync(SortJobState state, CancellationToken cancellationToken)
     {
-        await using (var fs = new FileStream(_tmpPath, WriteOptions))
-        {
-            await JsonSerializer.SerializeAsync(fs, state, JsonOptions, cancellationToken).ConfigureAwait(false);
-            await fs.FlushAsync(cancellationToken).ConfigureAwait(false);
-        }
-
-        File.Move(_tmpPath, _statePath, overwrite: true);
+        await using var fs = new FileStream(_statePath, WriteOptions);
+        await JsonSerializer.SerializeAsync(fs, state, JsonOptions, cancellationToken).ConfigureAwait(false);
+        await fs.FlushAsync(cancellationToken).ConfigureAwait(false);
     }
 
     private void ValidateStateAgainstRequest(SortJobState state)
@@ -461,10 +438,8 @@ public sealed class LargeFileSorter : IDisposable
 
     public void Dispose()
     {
-        string workingDir = Path.Combine(_tempDirectory, $"sort-{_jobId}");
-
-        if (Directory.Exists(workingDir))
-            Directory.Delete(workingDir, recursive: true);
+        if (Directory.Exists(_tempDirectory))
+            Directory.Delete(_tempDirectory, recursive: true);
     }
 
     private readonly record struct MergeItem(StreamReader Reader, string Line);

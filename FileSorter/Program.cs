@@ -1,7 +1,7 @@
 ﻿using FileSorter;
 
-var sorter = new LargeFileSorter(
-    @"C:\Users\YaraslauMiatselitsa\source\repos\FileGenerator\bin\Debug\net10.0\test.txt",
+using var sorter = new LargeFileSorter(
+    @"test.txt",
     @"output.txt",
     @"temp");
 
